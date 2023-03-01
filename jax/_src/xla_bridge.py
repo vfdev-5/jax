@@ -26,7 +26,7 @@ import platform as py_platform
 import threading
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 import warnings
-
+from jax._src.lib import xla_extension_version
 import numpy as np
 
 from jax._src import lib
@@ -85,6 +85,7 @@ flags.DEFINE_string(
     'Restricts the set of ROCM devices that JAX will use. Either "all", or a '
     'comma-separate list of integer device IDs.')
 
+
 def get_compile_options(
     num_replicas: int,
     num_partitions: int,
@@ -92,7 +93,9 @@ def get_compile_options(
     use_spmd_partitioning: bool = True,
     use_auto_spmd_partitioning: bool = False,
     auto_spmd_partitioning_mesh_shape=[],
-    auto_spmd_partitioning_mesh_ids=[]) -> xla_client.CompileOptions:
+    auto_spmd_partitioning_mesh_ids=[],
+    compiler_options: Optional[Dict[str, str]] = None,
+) -> xla_client.CompileOptions:
   """Returns the compile options to use, as derived from flag values.
 
   Args:
@@ -110,6 +113,7 @@ def get_compile_options(
       auto_spmd_partitioning search space.
     auto_spmd_partitioning_mesh_ids: device ids used to create
       auto_spmd_partitioning search space.
+    compiler_options: dict of additional options parsed by the compiler
   """
   compile_options = xla_client.CompileOptions()
   compile_options.num_replicas = num_replicas
@@ -145,6 +149,13 @@ def get_compile_options(
     assert device_assignment.replica_count() == num_replicas
     assert device_assignment.computation_count() == num_partitions
     compile_options.device_assignment = device_assignment
+
+  if compiler_options is not None:
+    if xla_extension_version >= 134:
+      compile_options.option_overrides = list(compiler_options.items())
+    else:
+      raise TypeError(
+          "`compiler_options` is only supported in later versions of jaxlib")
 
   debug_options = compile_options.executable_build_options.debug_options
   if lib.cuda_path is not None:

@@ -1522,8 +1522,12 @@ class PmapComputation(stages.XlaLowering):
     self._hlo = hlo
     self.compile_args = compile_args
 
-  def _compile_unloaded(self) -> Union[UnloadedPmapExecutable, PmapExecutable]:
-    return UnloadedPmapExecutable.from_hlo(self._hlo, **self.compile_args)
+  def _compile_unloaded(
+      self, compiler_options=None
+  ) -> Union[UnloadedPmapExecutable, PmapExecutable]:
+    return UnloadedPmapExecutable.from_hlo(
+        self._hlo, **self.compile_args, compiler_options=compiler_options
+    )
 
   # -- stages.XlaLowering overrides
 
@@ -1540,11 +1544,13 @@ class PmapComputation(stages.XlaLowering):
     return self._hlo
 
   @profiler.annotate_function
-  def compile(self) -> PmapExecutable:
-    if self._executable is None:
-      executable = self._compile_unloaded()
+  def compile(self, compiler_options=None) -> PmapExecutable:
+    if self._executable is None or compiler_options is not None:
+      executable = self._compile_unloaded(compiler_options=compiler_options)
       if isinstance(executable, UnloadedPmapExecutable):
         executable = executable.load()
+      if compiler_options is not None:
+        return executable
       self._executable = executable
     return self._executable
 
@@ -1572,7 +1578,8 @@ class UnloadedPmapExecutable:
                unordered_effects: List[core.Effect],
                ordered_effects: List[core.Effect],
                host_callbacks: List[Any],
-               keepalive: Any):
+               keepalive: Any,
+               compiler_options=None):
     devices = pci.devices
     if devices is None:
       if shards.num_global_shards > xb.device_count(pci.backend):
@@ -1629,6 +1636,7 @@ class UnloadedPmapExecutable:
         num_partitions=parts.num_partitions,
         device_assignment=device_assignment,
         use_spmd_partitioning=use_spmd_partitioning,
+        compiler_options=compiler_options,
     )
     compile_options.parameter_is_tupled_arguments = tuple_args
 
@@ -3037,7 +3045,8 @@ class MeshComputation(stages.XlaLowering):
   def _compile_unloaded(
       self,
       _allow_propagation_to_outputs: Optional[Sequence[bool]] = None,
-      _allow_compile_replicated: bool = True
+      _allow_compile_replicated: bool = True,
+      compiler_options=None,
   ) -> Union[UnloadedMeshExecutable, MeshExecutable]:
     if self.is_trivial:
       return MeshExecutable.from_trivial_jaxpr(**self.compile_args)
@@ -3046,6 +3055,7 @@ class MeshComputation(stages.XlaLowering):
           self._name,
           self._hlo,
           **self.compile_args,
+          compiler_options=compiler_options,
           _allow_propagation_to_outputs=_allow_propagation_to_outputs,
           _allow_compile_replicated=_allow_compile_replicated)  # type: ignore
 
@@ -3067,14 +3077,21 @@ class MeshComputation(stages.XlaLowering):
       raise ValueError("A trivial computation has no StableHLO")
     return self._hlo
 
-  def compile(self,
-              _allow_propagation_to_outputs: Optional[Sequence[bool]] = None,
-              _allow_compile_replicated: bool = True) -> MeshExecutable:
-    if self._executable is None:
+  def compile(
+      self,
+      _allow_propagation_to_outputs: Optional[Sequence[bool]] = None,
+      _allow_compile_replicated: bool = True,
+      compiler_options=None,
+  ) -> MeshExecutable:
+    if self._executable is None or compiler_options is not None:
       executable = self._compile_unloaded(
-          _allow_propagation_to_outputs, _allow_compile_replicated)
+          _allow_propagation_to_outputs,
+          _allow_compile_replicated,
+          compiler_options=compiler_options)
       if isinstance(executable, UnloadedMeshExecutable):
         executable = executable.load()
+      if compiler_options is not None:
+        return executable
       self._executable = executable
     return self._executable
 
@@ -3225,7 +3242,8 @@ class UnloadedMeshExecutable:
                backend: xb.XlaBackend,
                device_assignment: Sequence[xc.Device],
                committed: bool,
-               pmap_nreps: int = 1
+               pmap_nreps: int = 1,
+               compiler_options=None
   ) -> Union[MeshExecutable, UnloadedMeshExecutable]:
 
     dev: np.ndarray
@@ -3255,6 +3273,7 @@ class UnloadedMeshExecutable:
         device_assignment=xla_device_assignment,
         use_spmd_partitioning=spmd_lowering,
         use_auto_spmd_partitioning=auto_spmd_lowering,
+        compiler_options=compiler_options,
     )
     if auto_spmd_lowering:
       assert mesh is not None
