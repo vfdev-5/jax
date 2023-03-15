@@ -1303,6 +1303,32 @@ class RoundTripToTfTest(tf_test_util.JaxToTfTestCase):
     _, (g_f4_ft,) = tf_test_util.ComputeTfValueAndGrad(f4_tf, [x])
     self.assertAllClose(jax.grad(f(4))(x), g_f4_ft.numpy())
 
+  def test_use_custom_call(self):
+    const = tf.Variable(0.0, dtype=tf.float32)
+
+    @tf.function
+    def tf_func_1(x):
+      return x * x + const
+
+    @tf.function
+    def tf_func_2(x, y):
+      return tf_func_1(x) + y
+
+    @tf.function
+    def tf_func_3(x, y, z):
+      return tf_func_2(x, y) + z, z
+
+    x = jnp.array(3.0, dtype=jnp.float32)
+    y = jnp.array(3.0, dtype=jnp.float32)
+    z = jnp.array(5.0, dtype=jnp.float32)
+    f_jax = jax.jit(jax2tf.call_tf(tf_func_3, use_custom_call=False))
+    stablehlo_module = f_jax.lower(x, y, z).compiler_ir("stablehlo")
+    print("stablehlo_str with use_custom_call=False:", str(stablehlo_module))
+
+    f_jax = jax.jit(jax2tf.call_tf(tf_func_3, use_custom_call=True))
+    stablehlo_module = f_jax.lower(x, y, z).compiler_ir("stablehlo")
+    print("stablehlo_str with use_custom_call=True:", str(stablehlo_module))
+
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

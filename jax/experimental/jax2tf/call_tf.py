@@ -24,7 +24,7 @@ https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#callin
 """
 import enum
 import functools
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple, List
 
 from absl import logging
 
@@ -62,8 +62,13 @@ TfVal = jax2tf_internal.TfVal
 # DLPack, if we are careful.
 _DLPACK_PLATFORMS = ("gpu",)
 
-def call_tf(callable_tf: Callable, has_side_effects=True,
-            output_shape_dtype=None) -> Callable:
+
+def call_tf(
+    callable_tf: Callable,
+    has_side_effects=True,
+    output_shape_dtype=None,
+    use_custom_call=False,
+) -> Callable:
   """Calls a TensorFlow function from JAX, with support for reverse autodiff.
 
   The ``callable_tf`` will be called with TensorFlow-compatible arguments (
@@ -92,15 +97,16 @@ def call_tf(callable_tf: Callable, has_side_effects=True,
     has_side_effects: if True then it ensures that instances of this primitive
       are not removed or replicated by JAX optimizations such as dead-code
       elimination.
-    output_shape_dtype: An optional declaration of the expected shapes and dtypes
-      from the called TensorFlow function. If given it will be used during JAX
-      tracing to form the abstract values of the results of the `call_tf`. If
-      not given then we form a `tf.Graph` for the called TensorFlow function and
-      we use the TensorFlow-inferred shapes and types. Must be a pytree matching the
-      structure of the nested structure returned from the TensorFlow function,
-      containing objects with `.shape` and `.dtype` attributes,
-      e.g., `jax.ShapeDtypeStruct` or `jax.Array`.
-
+    output_shape_dtype: An optional declaration of the expected shapes and
+      dtypes from the called TensorFlow function. If given it will be used
+      during JAX tracing to form the abstract values of the results of the
+      `call_tf`. If not given then we form a `tf.Graph` for the called
+      TensorFlow function and we use the TensorFlow-inferred shapes and types.
+      Must be a pytree matching the structure of the nested structure returned
+      from the TensorFlow function, containing objects with `.shape` and
+      `.dtype` attributes, e.g., `jax.ShapeDtypeStruct` or `jax.Array`.
+    use_custom_call: PLEASE DO NOT USE IT since it is experimental. We may
+      change the name in the future.
   Returns: a JAX callable that can be invoked with JAX pytree arguments, in
     op-by-op mode or in a staged context. This callable can be used with
     JAX's reverse-mode autodiff (:func:`jax.grad`).
@@ -172,7 +178,9 @@ def call_tf(callable_tf: Callable, has_side_effects=True,
         function_flat_tf=function_flat_tf,
         args_flat_sig_tf=args_flat_sig_tf,
         output_avals=output_avals,
-        has_side_effects=has_side_effects)
+        has_side_effects=has_side_effects,
+        use_custom_call=use_custom_call,
+    )
 
     # We must have called callable_flat_tf by nοw
     assert res_treedef is not None
@@ -388,8 +396,16 @@ def _call_tf_abstract_eval(*args_flat_avals,
 call_tf_p.def_effectful_abstract_eval(_call_tf_abstract_eval)
 
 
-def _call_tf_lowering(ctx, *args_op, platform,
-                      function_flat_tf, args_flat_sig_tf, **_):
+def _call_tf_lowering(
+    ctx,
+    *args_op,
+    platform,
+    function_flat_tf,
+    args_flat_sig_tf,
+    has_side_effects,
+    use_custom_call,
+    **_,
+):
   # This will most likely hit the cache, because we used it for abstract_eval
   # We use the same TF lowering device as for the embedding JAX computation.
   # One example when this is needed is when the code refers to variables on one
@@ -400,8 +416,13 @@ def _call_tf_lowering(ctx, *args_op, platform,
     tf_platform = "GPU"
   else:
     raise ValueError("platform {platform} not supported")
-  code_gen, _ = _code_generator_and_avals(function_flat_tf, args_flat_sig_tf,  # type: ignore
-                                          tf_platform)
+  code_gen, _ = _code_generator_and_avals(
+      function_flat_tf,
+      args_flat_sig_tf,  # type: ignore
+      tf_platform,
+      use_custom_call,
+      has_side_effects,
+  )
   assert code_gen is not None
   return code_gen(ctx.module_context, args_op)
 
@@ -411,9 +432,14 @@ def _code_generator_and_avals(
     function_flat_tf,
     args_flat_sig_tf,
     tf_platform,
-) -> Tuple[Optional[Callable[[mlir.ModuleContext, Sequence[ir.Value]],
-                             Sequence[ir.Value]]],
-           Sequence[core.ShapedArray]]:
+    use_custom_call,
+    has_side_effects,
+) -> Tuple[
+    Optional[
+        Callable[[mlir.ModuleContext, Sequence[ir.Value]], Sequence[ir.Value]]
+    ],
+    Sequence[core.ShapedArray],
+]:
   # TODO(necula): we have refactored the code to not need to lower the code
   # just in order to get the avals, so in fact the returned avals from this
   # function are never used. We keep it here for now in case we detect
@@ -440,6 +466,20 @@ def _code_generator_and_avals(
         captured_inputs.append(inp_vars[0])
       else:
         captured_inputs.append(inp)
+
+  def code_gen_custom_call(ctx, args_op):  # pylint: disable=unused-argument
+    captured_ops = tuple(
+        mlir.ir_constant(np.asarray(inp), canonicalize_types=False)
+        for inp in captured_inputs
+    )
+    return emit_tf_embedded_graph_callback(
+        concrete_function_flat_tf,
+        tuple(args_op) + captured_ops,
+        has_side_effects,
+    )
+
+  if use_custom_call:
+    return code_gen_custom_call, None
 
   def convert_to_spec(x):
     if isinstance(x, tf.TensorSpec):
@@ -494,6 +534,13 @@ def _code_generator_and_avals(
     captured_ops = tuple(mlir.ir_constant(np.asarray(inp),
                                           canonicalize_types=False)
                          for inp in captured_inputs)
+    if use_custom_call:
+      return emit_tf_embedded_graph_callback(
+          concrete_function_flat_tf,
+          tuple(args_op) + captured_ops,
+          has_side_effects,
+      )
+
     submodule = mlir.xla_computation_to_mlir_module(xla_comp)
     symtab = ir.SymbolTable(submodule.operation)
     callee_result_types = symtab["main"].type.results
@@ -518,6 +565,7 @@ def _code_generator_and_avals(
 
   return code_gen, result_avals
 
+
 def _register_call_lowering(platform):
   mlir.register_lowering(call_tf_p, functools.partial(_call_tf_lowering,
                                                       platform=platform),
@@ -534,3 +582,63 @@ def _jax2tf_call_tf(*args: TfVal,
   return res_tf_flat
 
 jax2tf_internal.tf_impl[call_tf_p] = _jax2tf_call_tf
+
+
+def emit_tf_embedded_graph_callback(
+    concrete_function_flat_tf,
+    operands: List[ir.Value],
+    has_side_effects,
+):
+  """Emits MLIR about tf.graph calls back.
+
+  All call_tf caller function information is stored in tf.metadata.
+  This includes:
+  (1) The caller function name: This name will be used by the runtime to execute
+  the callback.
+  (2) The FunctionDef Dict: This list includes the caller function and all
+  related callees. By storing this information in tf.metadata, we can easily
+  retrieve it at runtime.
+  (3) The platform where to run this call_tf function.
+  """
+  call_target_name = "tf_embedded_graph"
+
+  # Generate metadata as attributes:
+  func_def_list = [concrete_function_flat_tf.function_def] + [
+      func.definition
+      for func in concrete_function_flat_tf.graph._functions.values()
+  ]
+  tf_metadata = {
+      "call_tf_func_name": ir.StringAttr.get(concrete_function_flat_tf.name),
+      "function_def_dict": ir.DictAttr.get(
+          {
+              str(f.signature.name): ir.StringAttr.get(f.SerializeToString())
+              for f in func_def_list
+          },
+      ),
+      "platform": ir.StringAttr.get("host"),
+  }
+
+  result_avals = [
+      core.ShapedArray(shape, jax2tf_internal._to_jax_dtype(dtype))
+      for dtype, shape in zip(
+          concrete_function_flat_tf.output_dtypes,
+          concrete_function_flat_tf.output_shapes,
+      )
+  ]
+
+  result_types = util.flatten(
+      [mlir.aval_to_ir_types(aval) for aval in result_avals]
+  )
+
+  result = hlo.CustomCallOp(
+      result_types,
+      operands,
+      call_target_name=ir.StringAttr.get(call_target_name),
+      has_side_effect=ir.BoolAttr.get(has_side_effects),
+      api_version=mlir.i32_attr(2),
+      called_computations=ir.ArrayAttr.get([]),
+      backend_config=ir.StringAttr.get(""),
+  )
+  # Store TF metadata in unregistered attribute
+  result.attributes["tf.metadata"] = ir.DictAttr.get(tf_metadata)
+  return result.results
