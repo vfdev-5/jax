@@ -21,27 +21,33 @@ from functools import partial
 import os
 import re
 import threading
-from typing import Callable, Sequence, Optional, Dict, Any
+from typing import Callable, Sequence, Optional, Dict, Any, Tuple
+from absl import flags
 
 import jax
 from jax._src import distributed
-from jax._src.config import config
 from jax._src import array
 from jax._src import sharding
 from jax._src import sharding_impls
 from jax._src import typing
-from jax.sharding import Mesh
 import jax.numpy as jnp
 import numpy as np
 import tensorstore as ts
 
 
-TS_CONTEXT = ts.Context({'file_io_concurrency': {'limit': 128}})
+_TS_CONTEXT = ts.Context({'file_io_concurrency': {'limit': 128}})
+_COORDINATOR_SERVER = None
+_COORDINATOR_PORT = 9990
+_COORDINATOR_NAMED_PORT = 'ocdbt'
 _REMOVED_VALUE = 'Value removed'
 _CHECKPOINT_SUCCESS = 'checkpoint_write_success'
 _module_unique_count = itertools.count()
 
 logger = logging.getLogger(__name__)
+
+_OCDBT_PORT = flags.DEFINE_string(
+    'ocdbt_port', None, 'Port for OCDBT coordinator.'
+)
 
 
 async def create_async_array_from_callback(
@@ -142,7 +148,9 @@ class _LimitInFlightBytes:
       self._cv.notify_all()
 
 
-async def async_serialize(arr_inp, tensorstore_spec, commit_future=None):
+async def async_serialize(
+    arr_inp, tensorstore_spec, commit_future=None, context=_TS_CONTEXT
+):
   if (isinstance(arr_inp, array.ArrayImpl) and jax.process_count() > 1 and
       arr_inp.is_fully_addressable):
     raise ValueError('Passing fully addressable Arrays to a multiprocess '
@@ -154,7 +162,11 @@ async def async_serialize(arr_inp, tensorstore_spec, commit_future=None):
 
   if jax.process_index() == 0:
     open_future = ts.open(
-        ts.Spec(tensorstore_spec), create=True, open=True, context=TS_CONTEXT)
+        ts.Spec(tensorstore_spec),
+        create=True,
+        open=True,
+        context=context,
+    )
     # Asynchronous case.
     if commit_future is not None:
       assert isinstance(commit_future, list)
@@ -168,7 +180,11 @@ async def async_serialize(arr_inp, tensorstore_spec, commit_future=None):
   # tensorstore object.
   # For every process other than `0`, we open with `assume_metadata=True`.
   t = await ts.open(
-      ts.Spec(tensorstore_spec), open=True, assume_metadata=True, context=TS_CONTEXT)
+      ts.Spec(tensorstore_spec),
+      open=True,
+      assume_metadata=True,
+      context=context,
+  )
 
   async def _write_array(shard):
     if shard.replica_id == 0:
@@ -225,10 +241,15 @@ def estimate_read_memory_footprint(t: ts.TensorStore) -> int:
   return num_bytes
 
 
-async def async_deserialize(in_sharding, tensorstore_spec,
-                            global_shape=None, dtype=None,
-                            byte_limiter: Optional[_LimitInFlightBytes] = None):
-  t = await ts.open(ts.Spec(tensorstore_spec), open=True, context=TS_CONTEXT)
+async def async_deserialize(
+    in_sharding,
+    tensorstore_spec,
+    global_shape=None,
+    dtype=None,
+    byte_limiter: Optional[_LimitInFlightBytes] = None,
+    context=_TS_CONTEXT,
+):
+  t = await ts.open(ts.Spec(tensorstore_spec), open=True, context=context)
   shape = t.shape if global_shape is None else global_shape
   new_shard_shape = in_sharding.shard_shape(tuple(shape))
 
@@ -261,11 +282,14 @@ async def async_deserialize(in_sharding, tensorstore_spec,
   return await create_async_array_from_callback(tuple(shape), in_sharding, cb)
 
 
-def run_deserialization(shardings: Sequence[sharding.Sharding],
-                        tensorstore_specs: Sequence[Dict[str, Any]],
-                        global_shapes: Optional[Sequence[array.Shape]] = None,
-                        dtypes: Optional[Sequence[typing.DTypeLike]] = None,
-                        concurrent_gb: int = 32):
+def run_deserialization(
+    shardings: Sequence[sharding.Sharding],
+    tensorstore_specs: Sequence[Dict[str, Any]],
+    global_shapes: Optional[Sequence[array.Shape]] = None,
+    dtypes: Optional[Sequence[typing.DTypeLike]] = None,
+    concurrent_gb: int = 32,
+    context: Optional[ts.Context] = None,
+):
   concurrent_bytes = concurrent_gb * 10**9
 
   async def _run_deserializer():
@@ -273,16 +297,48 @@ def run_deserialization(shardings: Sequence[sharding.Sharding],
     byte_limiter = _LimitInFlightBytes(concurrent_bytes)
 
     future_arrays = jax.tree_util.tree_map(
-        partial(async_deserialize, byte_limiter=byte_limiter),
-        shardings, tensorstore_specs,
-        [None] * len(tensorstore_specs) if global_shapes is None else global_shapes,
-        [None] * len(tensorstore_specs) if dtypes is None else dtypes)
+        partial(async_deserialize, byte_limiter=byte_limiter, context=context),
+        shardings,
+        tensorstore_specs,
+        [None] * len(tensorstore_specs)
+        if global_shapes is None
+        else global_shapes,
+        [None] * len(tensorstore_specs) if dtypes is None else dtypes,
+    )
     return await asyncio.gather(*future_arrays)
   return asyncio.run(_run_deserializer())
 
 
 def _get_key(key: str):
   return f'tensorstore_checkpoint_{key}'
+
+
+def create_coordinator_server_and_context() -> (
+    Tuple[ts.Context, Optional[ts.ocdbt.DistributedCoordinatorServer]]
+):
+  global _COORDINATOR_SERVER
+  coordinator_address = distributed.global_state.coordinator_address
+  coordinator_address = coordinator_address.split(':')[0]
+  run_on_borg = coordinator_address.startswith('/bns/')
+  port = _COORDINATOR_PORT
+  if run_on_borg:
+    port = _COORDINATOR_NAMED_PORT
+  ts_context = {
+      'ocdbt_coordinator': {'address': f'{coordinator_address}:{port}'},
+  }
+
+  if distributed.global_state.process_id == 0 and _COORDINATOR_SERVER is None:
+    if _OCDBT_PORT.value is not None:
+      port = _OCDBT_PORT.value
+    if run_on_borg:
+      bind_address = f'[::]:{port}'
+    else:
+      bind_address = f'{coordinator_address}:{port}'
+    logging.info('Starting DistributedCoordinatorServer at: %s', bind_address)
+    _COORDINATOR_SERVER = ts.ocdbt.DistributedCoordinatorServer(
+        {'bind_addresses': [bind_address]}
+    )
+  return ts.Context(ts_context, parent=_TS_CONTEXT), _COORDINATOR_SERVER
 
 
 class GlobalAsyncCheckpointManagerBase(metaclass=abc.ABCMeta):
@@ -352,13 +408,21 @@ class GlobalAsyncCheckpointManagerBase(metaclass=abc.ABCMeta):
 
 class AsyncManager:
 
-  def __init__(self, timeout_secs=300):
+  def __init__(
+      self, timeout_secs: int = 300, enable_coordinator_server: bool = False
+  ):
     self._timeout_secs = timeout_secs
     self._timeout_in_ms = self._timeout_secs * 1000
 
     self._commit_futures = None
     self._thread = None
     self._exception = None
+
+    self._ts_context = None
+    if enable_coordinator_server:
+      self._ts_context, self._coordinator_server = (
+          create_coordinator_server_and_context()
+      )
 
     if distributed.global_state.client is None:
       raise ValueError('Please initialize the distributed system via '
@@ -469,7 +533,11 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
 
     async def _run_serializer():
       future_writer = jax.tree_util.tree_map(
-          async_serialize, arrays, tensorstore_specs, commit_futures)
+          partial(async_serialize, context=self._ts_context),
+          arrays,
+          tensorstore_specs,
+          commit_futures,
+      )
       return await asyncio.gather(*future_writer)
 
     asyncio.run(_run_serializer())
@@ -485,5 +553,10 @@ class GlobalAsyncCheckpointManager(AsyncManager, GlobalAsyncCheckpointManagerBas
                   global_shapes: Optional[Sequence[array.Shape]] = None,
                   dtypes: Optional[Sequence[typing.DTypeLike]] = None):
     self.wait_until_finished()
-    return run_deserialization(shardings, tensorstore_specs,
-                               global_shapes, dtypes)
+    return run_deserialization(
+        shardings,
+        tensorstore_specs,
+        global_shapes,
+        dtypes,
+        context=self._ts_context,
+    )
