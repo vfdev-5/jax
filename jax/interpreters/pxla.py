@@ -45,8 +45,6 @@ from jax._src.interpreters.pxla import (
   SPMDBatchTrace as SPMDBatchTrace,
   ShardInfo as ShardInfo,
   ShardedAxis as ShardedAxis,
-  ShardedDeviceArray as ShardedDeviceArray,
-  ShardedDeviceArrayBase as ShardedDeviceArrayBase,
   ShardingSpec as ShardingSpec,
   TileManual as TileManual,
   TileVectorize as TileVectorize,
@@ -127,17 +125,9 @@ from jax._src.mesh import (
 from jax._src.mesh import Mesh as _deprecated_Mesh
 from jax._src.interpreters.pxla import (
   PartitionSpec as _deprecated_PartitionSpec,
+  ShardedDeviceArray as _deprecated_ShardedDeviceArray,
   make_sharded_device_array as _deprecated_make_sharded_device_array,
 )
-
-import typing
-if typing.TYPE_CHECKING:
-  from jax._src.mesh import Mesh as Mesh
-  from jax._src.interpreters.pxla import (
-    PartitionSpec as PartitionSpec,
-    make_sharded_device_array as make_sharded_device_array,
-  )
-del typing
 
 _deprecations = {
     # Added Feb 8, 2023:
@@ -145,12 +135,21 @@ _deprecations = {
         "jax.interpreters.pxla.Mesh is deprecated. Use jax.sharding.Mesh.",
         _deprecated_Mesh,
     ),
+    # Added Feb 8, 2023:
     "PartitionSpec": (
         (
             "jax.interpreters.pxla.PartitionSpec is deprecated. Use "
             "jax.sharding.PartitionSpec."
         ),
         _deprecated_PartitionSpec,
+    ),
+    # Added March 15, 2023:
+    "ShardedDeviceArray": (
+        (
+            "jax.interpreters.pxla.ShardedDeviceArray is deprecated. Use "
+            "jax.Array."
+        ),
+        _deprecated_ShardedDeviceArray,
     ),
     # make_sharded_device_array is deprecated as of March 3, 2023. jax.Array
     # is the default since November 2022.
@@ -163,6 +162,16 @@ _deprecations = {
     ),
 }
 
-from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
-__getattr__ = _deprecation_getattr(__name__, _deprecations)
-del _deprecation_getattr
+import typing
+if typing.TYPE_CHECKING:
+  from jax._src.mesh import Mesh as Mesh
+  from jax._src.interpreters.pxla import (
+    PartitionSpec as PartitionSpec,
+    ShardedDeviceArray as ShardedDeviceArray,
+    make_sharded_device_array as make_sharded_device_array,
+  )
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del typing
