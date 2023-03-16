@@ -97,3 +97,54 @@ class _JaxPjrtUnpickler(pickle.Unpickler):
     if pid[0] == 'client':
       return self.backend
     raise pickle.UnpicklingError
+
+
+class CompileOnlyTopologyBasedDevice:
+  """Compile only device."""
+
+  def __init__(self, client, attrs):
+    self.__dict__.update(**attrs)
+    self.client = client
+
+  @property
+  def platform(self):
+    return self.client.platform
+
+
+class CompileOnlyTopologyBasedClient:
+  """Compile only client."""
+
+  def __init__(self, topology):
+    self._devices = [
+        CompileOnlyTopologyBasedDevice(self, attrs)
+        for attrs in topology.device_attributes
+    ]
+    self.topology = topology
+
+  def process_index(self):
+    return 0
+
+  def devices(self):
+    return self._devices
+
+  @property
+  def platform(self):
+    return self.topology.platform
+
+  @property
+  def platform_version(self):
+    return self.topology.platform_version
+
+  def compile(self, *args, **kwargs):
+    return xc._xla.compile(self.topology, *args, **kwargs)  # pylint: disable=protected-access
+
+  def device_count(self):
+    return len(self._devices)
+
+
+_JaxPjrtPickler.device_types += (CompileOnlyTopologyBasedDevice,)
+_JaxPjrtPickler.client_types += (CompileOnlyTopologyBasedClient,)
+
+
+def _wrap_pjrt_topology(topology):
+  return CompileOnlyTopologyBasedClient(topology).devices()

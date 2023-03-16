@@ -653,3 +653,8 @@ def host_ids(
 
 def using_pjrt_c_api(backend=None):
   return "PJRT C API" in get_backend(backend).platform_version
+
+
+def make_default_pjrt_tpu_topology():
+  raise NotImplementedError("make_default_pjrt_tpu_topology is not implemented")
+

@@ -29,10 +29,11 @@ from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
 from jax._src.lib import xla_client as xc
 from jax._src.util import safe_zip
+from jax._src.config import flags
 from jax.interpreters import pxla
 from jax.experimental.pjit import pjit
 from jax.experimental.serialize_executable import (
-    compile_and_serialize, load_compiled)
+    compile_and_serialize, load_compiled, _wrap_pjrt_topology)
 from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
 from jax._src import array
@@ -104,7 +105,7 @@ class JaxArrayTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       ("mesh_x_y", P("x", "y"),
-       # There are more slices but for convienient purposes, checking for only
+       # There are more slices but for convenient purposes, checking for only
        # 2. The indices + shard_shape + replica_id should be unique enough.
        ((slice(0, 2), slice(0, 1)), (slice(0, 2), slice(1, 2))),
        (2, 1),
@@ -1010,7 +1011,7 @@ class RngShardingTest(jtu.JaxTestCase):
     y_ref1 = f(jax.device_put(x, jax.devices()[0]))
     self.assertArraysEqual(y, y_ref1)
 
-  def test_pickle_pjit_lower(self):
+  def check_for_compile_options(self):
     example_exe = jax.jit(lambda x: x * x).lower(
         core.ShapedArray(
             (2, 2), dtype=np.float32)).compile()._executable.xla_executable
@@ -1023,6 +1024,9 @@ class RngShardingTest(jtu.JaxTestCase):
       if str(e) == 'UNIMPLEMENTED: CompileOptions not available.':
         raise unittest.SkipTest('Serialization not supported')
       raise e
+
+  def test_pickle_pjit_lower(self):
+    self.check_for_compile_options()
 
     def fun(x):
       return x * x
@@ -1042,6 +1046,37 @@ class RngShardingTest(jtu.JaxTestCase):
     verify_serialization(
         jax.pmap(lambda x: x * x).lower(
             np.zeros((len(jax.devices()), 4), dtype=np.float32)))
+
+  def test_topology_pjit_serialize(self):
+    self.check_for_compile_options()
+
+    try:
+      topology = xb.make_default_pjrt_tpu_topology()
+    except NotImplementedError:
+      raise unittest.SkipTest('PJRT Topology not supported')
+
+    if flags.FLAGS.jax_test_with_persistent_compilation_cache:
+      raise unittest.SkipTest('Compilation caching not yet supported.')
+
+    @jax.jit
+    def fn(x):
+      return x * x
+
+    def lower_and_load(devices):
+      mesh = jax.sharding.Mesh(np.array(devices), ('x',))
+      s = jax.sharding.NamedSharding(mesh, P('x'))
+      x_shape = jax.ShapeDtypeStruct(
+          shape=(16,),
+          dtype=jnp.dtype('float32'),
+          sharding=s)
+      lowered = fn.lower(x_shape)
+      serialized, in_tree, out_tree = compile_and_serialize(lowered)
+      compiled = load_compiled(serialized, in_tree, out_tree)
+      return compiled
+
+    self.assertEqual(lower_and_load(jax.devices()).as_text(),
+                     lower_and_load(_wrap_pjrt_topology(topology)).as_text())
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
