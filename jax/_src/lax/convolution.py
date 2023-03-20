@@ -74,9 +74,9 @@ def conv_general_dilated(
     rhs: a rank `n+2` dimensional array of kernel weights.
     window_strides: a sequence of `n` integers, representing the inter-window
       strides.
-    padding: either the string `'SAME'`, the string `'VALID'`, or a sequence of
-      `n` `(low, high)` integer pairs that give the padding to apply before and
-      after each spatial dimension.
+    padding: either the string `'SAME'`, `'SAME_LOWER'`, `'VALID'`, or a
+      sequence of `n` `(low, high)` integer pairs that give the padding to apply
+      before and after each spatial dimension.
     lhs_dilation: `None`, or a sequence of `n` integers, giving the
       dilation factor to apply in each spatial dimension of `lhs`. LHS dilation
       is also known as transposed convolution.
