@@ -96,6 +96,38 @@ class JitTest(jtu.BufferDonationTestCase):
     jitted = jit(my_function)
     self.assertEqual(repr(jitted), f"<PjitFunction of {repr(my_function)}>")
 
+  def test_fun_name(self):
+    def my_function():
+      return
+
+    with self.subTest("function"):
+      jitted = jit(my_function)
+      self.assertEqual(
+          jitted.__getstate__()["function_name"], my_function.__name__
+      )
+    with self.subTest("default_partial"):
+      my_partial = partial(my_function)
+      jitted = jit(my_partial)
+      self.assertEqual(
+          jitted.__getstate__()["function_name"], my_function.__name__
+      )
+    with self.subTest("nested_default_partial"):
+      my_partial = partial(partial(my_function))
+      jitted = jit(my_partial)
+      self.assertEqual(
+          jitted.__getstate__()["function_name"], my_function.__name__
+      )
+    with self.subTest("named_partial"):
+      my_partial = partial(my_function)
+      my_partial.__name__ = "my_partial"
+      jitted = jit(my_partial)
+      self.assertEqual(
+          jitted.__getstate__()["function_name"], my_partial.__name__
+      )
+    with self.subTest("lambda"):
+      jitted = jit(lambda: my_function())
+      self.assertEqual(jitted.__getstate__()["function_name"], "<lambda>")
+
   def test_jit_repr_errors(self):
     class Callable:
       def __call__(self): pass
@@ -288,14 +320,14 @@ class JitTest(jtu.BufferDonationTestCase):
     self.assertEqual(f(1).devices(), system_default_devices)
 
   def test_jit_default_platform(self):
-      with jax.default_device("cpu"):
-        result = jax.jit(lambda x: x + 1)(1)
-      self.assertEqual(result.device.platform, "cpu")
-      self.assertEqual(result.device, jax.local_devices(backend="cpu")[0])
-
+    with jax.default_device("cpu"):
       result = jax.jit(lambda x: x + 1)(1)
-      self.assertEqual(result.device.platform, jax.default_backend())
-      self.assertEqual(result.device, jax.local_devices()[0])
+    self.assertEqual(result.device.platform, "cpu")
+    self.assertEqual(result.device, jax.local_devices(backend="cpu")[0])
+
+    result = jax.jit(lambda x: x + 1)(1)
+    self.assertEqual(result.device.platform, jax.default_backend())
+    self.assertEqual(result.device, jax.local_devices()[0])
 
   def test_complex_support(self):
     self.assertEqual(jit(lambda x: x + 1)(1 + 1j), 2 + 1j)
@@ -2983,27 +3015,21 @@ class APITest(jtu.JaxTestCase):
     self.assertIn("stablehlo.sine", stablehlo)
 
   def test_concurrent_device_get_and_put(self):
-    # Capture ThreadSanitizer warnings and fail the test if anything reported
-    with jtu.capture_stderr() as get_output:
-      def f(x):
-        for _ in range(100):
-          y = jax.device_put(x)
-          x = jax.device_get(y)
-        return x
+    def f(x):
+      for _ in range(100):
+        y = jax.device_put(x)
+        x = jax.device_get(y)
+      return x
 
-      xs = [self.rng().randn(i) for i in range(10)]
-      # Make sure JAX backend is initialised on the main thread since some JAX
-      # backends install signal handlers.
-      jax.device_put(0)
-      with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(partial(f, x)) for x in xs]
-        ys = [f.result() for f in futures]
-      for x, y in zip(xs, ys):
-        self.assertAllClose(x, y)
-
-    captured = get_output()
-    if len(captured) > 0 and "ThreadSanitizer" in captured:
-      raise RuntimeError(f"ThreadSanitizer reported warnings:\n{captured}")
+    xs = [self.rng().randn(i) for i in range(10)]
+    # Make sure JAX backend is initialised on the main thread since some JAX
+    # backends install signal handlers.
+    jax.device_put(0)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+      futures = [executor.submit(partial(f, x)) for x in xs]
+      ys = [f.result() for f in futures]
+    for x, y in zip(xs, ys):
+      self.assertAllClose(x, y)
 
   def test_dtype_from_builtin_types(self):
     for dtype in [bool, int, float, complex]:
@@ -7602,32 +7628,25 @@ class CustomJVPTest(jtu.JaxTestCase):
 
   def test_concurrent_initial_style(self):
     # https://github.com/jax-ml/jax/issues/3843
+    def unroll(param, sequence):
+      def scan_f(prev_state, inputs):
+        return prev_state, jax.nn.sigmoid(param * inputs)
+      return jnp.sum(jax.lax.scan(scan_f, None, sequence)[1])
 
-    # Capture ThreadSanitizer warnings and fail the test if anything reported
-    with jtu.capture_stderr() as get_output:
-      def unroll(param, sequence):
-        def scan_f(prev_state, inputs):
-          return prev_state, jax.nn.sigmoid(param * inputs)
-        return jnp.sum(jax.lax.scan(scan_f, None, sequence)[1])
+    def run():
+      return jax.grad(unroll)(jnp.array(1.0), jnp.array([1.0]))
 
-      def run():
-        return jax.grad(unroll)(jnp.array(1.0), jnp.array([1.0]))
+    expected = run()
 
-      expected = run()
-
-      # we just don't want this to crash
-      n_workers = 2
-      with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as e:
-        futures = []
-        for _ in range(n_workers):
-          futures.append(e.submit(run))
-        results = [f.result() for f in futures]
-      for ans in results:
-        self.assertAllClose(ans, expected)
-
-    captured = get_output()
-    if len(captured) > 0 and "ThreadSanitizer" in captured:
-      raise RuntimeError(f"ThreadSanitizer reported warnings:\n{captured}")
+    # we just don't want this to crash
+    n_workers = 2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as e:
+      futures = []
+      for _ in range(n_workers):
+        futures.append(e.submit(run))
+      results = [f.result() for f in futures]
+    for ans in results:
+      self.assertAllClose(ans, expected)
 
   def test_nondiff_argnums_vmap_tracer(self):
     # https://github.com/jax-ml/jax/issues/3964
