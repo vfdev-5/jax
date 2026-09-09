@@ -872,7 +872,7 @@ def matmul6(a, b, config: TuningConfig):
 
 @jtu.with_config(jax_traceback_filtering="off")
 class MatmulTutorialSM12XTest(jtu.JaxTestCase, jtu.CudaArchSpecificTest):
-  BENCHMARK = False
+  BENCHMARK = True
 
   def setUp(self):
     super().setUp()
@@ -944,8 +944,8 @@ class MatmulTutorialSM12XTest(jtu.JaxTestCase, jtu.CudaArchSpecificTest):
     n = 8192
     k = 4096
     k1, k2, = jax.random.split(jax.random.key(42), 2)
-    a = jax.random.normal(k1, (m, k), dtype)
-    b = jax.random.normal(k2, (k, n), dtype)
+    a = jax.random.uniform(k1, (m, k), dtype)
+    b = jax.random.uniform(k2, (k, n), dtype)
 
     out = matmul_impl(a, b, example_config)
     out_ref = jnp.dot(a, b, precision=jax.lax.DotAlgorithmPreset.F16_F16_F32)
